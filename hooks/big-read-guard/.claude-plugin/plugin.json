@@ -1,0 +1,21 @@
+{
+  "name": "big-read-guard",
+  "description": "PreToolUse hook that denies a full Read of a text file over 32 KB and points Claude at Grep plus ranged reads. Images and PDFs are out of scope, an explicit offset or limit is the escape hatch.",
+  "version": "0.1.0",
+  "author": {
+    "name": "p-zmud",
+    "url": "https://github.com/p-zmud"
+  },
+  "homepage": "https://github.com/p-zmud/mcp-and-skills",
+  "repository": "https://github.com/p-zmud/mcp-and-skills",
+  "license": "MIT",
+  "keywords": [
+    "hook",
+    "context",
+    "tokens",
+    "read",
+    "guard",
+    "pretooluse"
+  ],
+  "hooks": "./hooks/hooks.json"
+}

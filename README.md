@@ -32,6 +32,14 @@ Specialized subagents with their own tools and system prompt.
 | ----- | ------------ | ------- |
 | [audytor-prawny-marketing](agents/audytor-prawny-marketing) | Audits content against Polish and EU law before it ships - ad disclosure, copyright and likeness, GDPR, terms of service, contests, regulated industries - and returns a verdict where every provision was opened in the run, not recalled. Agent output and entry docs are in Polish | `/plugin install audytor-prawny-marketing@pzmud` |
 
+### Hooks
+
+Shell and Python hooks that fire on Claude Code events, before the tool call runs.
+
+| Hook | What it does | Install |
+| ---- | ------------ | ------- |
+| [big-read-guard](hooks/big-read-guard) | Denies a full `Read` of a text file over 32 KB - the biggest controllable context sink there is - and answers with the size, the token cost and the way out: Grep, then ranged reads. Images and PDFs exempt, explicit `offset`/`limit` passes | `/plugin install big-read-guard@pzmud` |
+
 ### MCP
 
 Model Context Protocol servers exposing external APIs as tools.
@@ -53,6 +61,7 @@ Standalone command line tools, usually paired with a skill that teaches Claude t
 .claude-plugin/marketplace.json   registry - the single source of truth for /plugin
 skills/<name>/                    one installable plugin per skill
 agents/<name>/                    one installable plugin per subagent
+hooks/<name>/                     one installable plugin per hook
 mcp/<name>/                       one installable plugin per MCP server
 cli/<name>/                       standalone CLI tool + its skill wrapper
 docs/                             how to add an entry, plus copy-paste templates

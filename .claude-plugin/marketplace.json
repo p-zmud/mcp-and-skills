@@ -27,6 +27,20 @@
       ]
     },
     {
+      "name": "big-read-guard",
+      "source": "./hooks/big-read-guard",
+      "description": "PreToolUse hook that denies a full Read of a text file over 32 KB and points Claude at Grep plus ranged reads - images and PDFs exempt, an explicit offset or limit is the escape hatch",
+      "category": "hooks",
+      "keywords": [
+        "hook",
+        "context",
+        "tokens",
+        "read",
+        "guard",
+        "pretooluse"
+      ]
+    },
+    {
       "name": "purelymail",
       "source": "./cli/purelymail",
       "description": "pmail - stdlib-only Python CLI for Purelymail: mail over IMAP/SMTP plus account administration over API v0, with the skill that teaches Claude to drive it",
