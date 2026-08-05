@@ -1,0 +1,653 @@
+#!/usr/bin/env bash
+# ccswitch - a Claude Code account switcher built on CLAUDE_CODE_OAUTH_TOKEN.
+# One account = one token ('claude setup-token'). The active account is the token
+# exported from ~/.zshenv. Tokens live in ~/.config/ccswitch/<name>.token (600).
+# No Keychain involved, so it works headless (SSH, tmux, CI).
+#
+# The credentials written by /login (~/.claude/.credentials.json, the claudeAiOauth
+# key) BEAT the env token, and long-running claude sessions rewrite that file about
+# every 8 hours. Hence:
+#  - use/doctor strip claudeAiOauth surgically (mcpOAuth stays!),
+#  - 'ccswitch guard on' installs a launchd watcher (WatchPaths) that does the same
+#    automatically every time the file comes back.
+#
+# macOS only: it relies on BSD `stat`, `security`, `launchctl` and `lsof`.
+set -euo pipefail
+
+STORE="${CCSWITCH_HOME:-$HOME/.config/ccswitch}"
+CLAUDE_DIR="${CCSWITCH_CLAUDE_DIR:-$HOME/.claude}"
+ZSHENV="${CCSWITCH_ZSHENV:-$HOME/.zshenv}"
+VAR="CLAUDE_CODE_OAUTH_TOKEN"
+TOKEN_PREFIX="sk-ant-oat"
+KEYCHAIN_SVC="Claude Code-credentials"
+GUARD_LABEL="com.ccswitch.guard"
+GUARD_PLIST="$HOME/Library/LaunchAgents/$GUARD_LABEL.plist"
+BACKUP_DIR="$STORE/creds-backups"
+GUARD_LOG="$STORE/guard.log"
+
+# Absolute path to this script - the launchd guard has to point at wherever it
+# actually lives, not at a hardcoded directory.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+mkdir -p "$STORE"
+chmod 700 "$STORE" 2>/dev/null || true
+
+err()  { printf 'error: %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+mask() { # token -> start…end (never the whole thing)
+  local t="$1"
+  if [ "${#t}" -ge 20 ]; then printf '%s…%s' "${t:0:13}" "${t: -6}"; else printf '****'; fi
+}
+valid_name() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_-]+$'; }
+token_file() { printf '%s/%s.token' "$STORE" "$1"; }
+creds_file() { printf '%s/.credentials.json' "$CLAUDE_DIR"; }
+
+active_token() { # the token currently exported from ~/.zshenv (or empty)
+  [ -f "$ZSHENV" ] || return 0
+  local line val
+  line=$(grep "^export $VAR=" "$ZSHENV" 2>/dev/null | tail -1) || true
+  [ -n "$line" ] || return 0
+  val="${line#export $VAR=}"
+  case "$val" in
+    \'*\') val="${val#\'}"; val="${val%\'}";;
+    \"*\") val="${val#\"}"; val="${val%\"}";;
+  esac
+  printf '%s' "$val"
+}
+
+name_for_token() { # the account name holding this token (or empty)
+  local tok="$1" f n
+  [ -n "$tok" ] || return 0
+  for f in "$STORE"/*.token; do
+    [ -e "$f" ] || continue
+    if [ "$(cat "$f")" = "$tok" ]; then n=$(basename "$f"); printf '%s' "${n%.token}"; return 0; fi
+  done
+}
+
+# probe_token: checks a token live against the API (~1 s). Sets PROBE_STATUS
+# (ok|limit|fail|skip), PROBE_MSG, and PROBE_5H_RESET/PROBE_7D_RESET - the reset
+# times of the usage windows, which act as an account fingerprint (saved by
+# save_fingerprint; a status line can read it back to tell which account a
+# session is billing).
+# 'limit' means the token WORKS and the account is merely rate limited - that is
+# not a switching failure.
+# The token reaches curl over stdin (-H @-), never as an argument, so it does not
+# show up in `ps`.
+PROBE_STATUS=""; PROBE_MSG=""; PROBE_5H_RESET=""; PROBE_7D_RESET=""
+probe_token() {
+  local tok="$1" resp http rc rst
+  PROBE_STATUS="fail"; PROBE_MSG=""; PROBE_5H_RESET=""; PROBE_7D_RESET=""
+  [ "${CCSWITCH_SKIP_PROBE:-0}" = "1" ] && { PROBE_STATUS="skip"; PROBE_MSG="CCSWITCH_SKIP_PROBE"; return 0; }
+  command -v curl >/dev/null 2>&1 || { PROBE_STATUS="skip"; PROBE_MSG="no curl"; return 0; }
+  rc=0
+  resp=$(printf 'Authorization: Bearer %s\n' "$tok" | curl -s --max-time 20 -D - -o /dev/null \
+    https://api.anthropic.com/v1/messages \
+    -H @- \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    --data '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"system":"You are Claude Code, Anthropic'\''s official CLI for Claude.","messages":[{"role":"user","content":"ok"}]}' \
+    2>/dev/null) || rc=$?
+  [ "$rc" -ne 0 ] && { PROBE_MSG="curl rc=$rc (network/timeout)"; return 0; }
+  http=$(printf '%s\n' "$resp" | head -1 | awk '{print $2}')
+  PROBE_5H_RESET=$(printf '%s\n' "$resp" | grep -i '^anthropic-ratelimit-unified-5h-reset:' | head -1 | tr -d '\r' | awk '{print $2}') || true
+  PROBE_7D_RESET=$(printf '%s\n' "$resp" | grep -i '^anthropic-ratelimit-unified-7d-reset:' | head -1 | tr -d '\r' | awk '{print $2}') || true
+  case "$http" in
+    200) PROBE_STATUS="ok";;
+    429) PROBE_STATUS="limit"
+         rst=$(printf '%s\n' "$resp" | grep -i '^anthropic-ratelimit-unified-reset:' | head -1 | tr -d '\r' | awk '{print $2}') || true
+         [ -n "$rst" ] && PROBE_MSG="resets $(date -r "$rst" '+%d.%m %H:%M' 2>/dev/null)";;
+    401|403) PROBE_MSG="HTTP $http - token rejected or expired";;
+    *) PROBE_MSG="HTTP ${http:-?}";;
+  esac
+  return 0
+}
+
+FP_FILE="$STORE/fingerprints.json"
+
+save_fingerprint() { # merge the last probe_token result into fingerprints.json
+  local name="$1"
+  [ -n "$name" ] || return 0
+  [ "$PROBE_STATUS" = "skip" ] && return 0   # no data - leave the cache alone
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$FP_FILE" "$name" "$PROBE_STATUS" "${PROBE_5H_RESET:-}" "${PROBE_7D_RESET:-}" <<'PY' 2>/dev/null || true
+import json, os, sys, time
+path, name, status, r5, r7 = sys.argv[1:6]
+data = {}
+if os.path.exists(path):
+    try:
+        data = json.load(open(path))
+    except Exception:
+        data = {}
+old = data.get(name) or {}
+# the resets ARE the account identity; an empty new value (network failure)
+# must not wipe the old one
+data[name] = {
+    "status": status,
+    "five_h_reset": int(r5) if r5 else old.get("five_h_reset"),
+    "seven_d_reset": int(r7) if r7 else old.get("seven_d_reset"),
+    "updated": int(time.time()),
+}
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=1)
+os.replace(tmp, path)
+PY
+  chmod 600 "$FP_FILE" 2>/dev/null || true
+}
+
+probe_label() { # a readable label for the last probe_token
+  case "$PROBE_STATUS" in
+    ok)    printf 'OK';;
+    limit) printf 'LIMIT%s' "${PROBE_MSG:+ (${PROBE_MSG})}";;
+    skip)  printf 'check skipped (%s)' "$PROBE_MSG";;
+    *)     printf 'FAILED%s' "${PROBE_MSG:+ (${PROBE_MSG})}";;
+  esac
+}
+
+verify_token() { # 0 when the token authenticates (LIMIT also means: token is valid)
+  probe_token "$1"
+  case "$PROBE_STATUS" in ok|limit|skip) return 0;; *) return 1;; esac
+}
+
+write_active() { # make this token the active one in ~/.zshenv (backup, our line only)
+  local tok="$1" tmp
+  touch "$ZSHENV"
+  cp -p "$ZSHENV" "$STORE/zshenv.bak"
+  tmp=$(mktemp "$(dirname "$ZSHENV")/.zshenv.ccswitch.XXXXXX")   # same filesystem = atomic rename
+  grep -v "^export $VAR=" "$ZSHENV" > "$tmp" 2>/dev/null || true
+  printf "export %s='%s'\n" "$VAR" "$tok" >> "$tmp"
+  mv "$tmp" "$ZSHENV"
+  chmod 600 "$ZSHENV"
+}
+
+guard_log() { # append to guard.log (with simple rotation)
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$GUARD_LOG" 2>/dev/null || return 0
+  local sz; sz=$(stat -f %z "$GUARD_LOG" 2>/dev/null) || sz=0
+  if [ "$sz" -gt 524288 ]; then
+    tail -200 "$GUARD_LOG" > "$GUARD_LOG.tmp" 2>/dev/null && mv "$GUARD_LOG.tmp" "$GUARD_LOG" || true
+  fi
+}
+
+# --- /login credentials: detection and surgical removal ---
+
+hijack_in_file() { # 0 when the credentials file contains claudeAiOauth
+  local cf; cf=$(creds_file)
+  [ -f "$cf" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c 'import json,sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: sys.exit(1)
+sys.exit(0 if "claudeAiOauth" in d else 1)' "$cf" 2>/dev/null
+}
+
+keychain_login() { # 0 when the Keychain holds a /login entry
+  [ "${CCSWITCH_SKIP_KEYCHAIN:-0}" = "1" ] && return 1
+  security find-generic-password -s "$KEYCHAIN_SVC" >/dev/null 2>&1
+}
+
+strip_credentials() { # drop claudeAiOauth from the file (backup, mcpOAuth stays, atomic write)
+  # exit: 0=removed (stdout: backup path), 4=already clean, 3=unreadable or missing
+  local cf; cf=$(creds_file)
+  [ -f "$cf" ] || return 3
+  command -v python3 >/dev/null 2>&1 || return 3
+  python3 - "$cf" "$BACKUP_DIR" <<'PY'
+import json, os, sys, time
+path, backup_dir = sys.argv[1], sys.argv[2]
+try:
+    raw = open(path).read()
+    data = json.loads(raw)
+except Exception:
+    sys.exit(3)
+if "claudeAiOauth" not in data:
+    sys.exit(4)
+os.makedirs(backup_dir, exist_ok=True)
+os.chmod(backup_dir, 0o700)
+bp = os.path.join(backup_dir, "credentials-%s.json" % time.strftime("%Y%m%d-%H%M%S"))
+with open(bp, "w") as f:
+    f.write(raw)
+os.chmod(bp, 0o600)
+del data["claudeAiOauth"]
+tmp = path + ".ccswitch-tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+backups = sorted(n for n in os.listdir(backup_dir) if n.startswith("credentials-"))
+for old in backups[:-10]:
+    os.remove(os.path.join(backup_dir, old))
+print(bp)
+PY
+}
+
+notify() { # send a message through $CCSWITCH_NOTIFY_CMD; silent when it is unset
+  # The command runs through `sh -c` and receives the message as "$1", so it can
+  # carry its own flags, for example:
+  #   export CCSWITCH_NOTIFY_CMD='terminal-notifier -title ccswitch -message "$1"'
+  [ -n "${CCSWITCH_NOTIFY_CMD:-}" ] || return 0
+  sh -c "$CCSWITCH_NOTIFY_CMD" ccswitch-notify "$1" >/dev/null 2>&1 || true
+}
+
+long_running_claudes() { # print "pid<TAB>etime<TAB>cwd" for claude sessions older than 8h
+  local pid etime cmdline secs cwd
+  ps -axo pid=,etime=,command= 2>/dev/null | while read -r pid etime cmdline; do
+    case "$cmdline" in
+      claude|claude\ *|*/claude|*/claude\ *) : ;;
+      *) continue;;
+    esac
+    case "$cmdline" in *Claude.app*|*ccswitch*) continue;; esac
+    secs=$(printf '%s' "$etime" | awk -F'[-:]' '{
+      if (NF==4) print $1*86400+$2*3600+$3*60+$4;
+      else if (NF==3) print $1*3600+$2*60+$3;
+      else if (NF==2) print $1*60+$2; else print 0 }')
+    [ "${secs:-0}" -gt 28800 ] || continue
+    cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | grep '^n' | head -1 | cut -c2-) || cwd=""
+    printf '%s\t%s\t%s\n' "$pid" "$etime" "${cwd:-?}"
+  done
+}
+
+fix_login_credentials() { # remove claudeAiOauth plus the Keychain entry; reports on stdout
+  local bp rc=0 removed=0
+  bp=$(strip_credentials) || rc=$?
+  if [ "$rc" = 0 ]; then
+    removed=1
+    printf '✓ Removed the /login credentials from %s (mcpOAuth kept).\n' "$(creds_file)"
+    printf '  Backup: %s\n' "$bp"
+    guard_log "strip claudeAiOauth ($1); backup: $bp"
+  elif [ "$rc" = 3 ] && [ -f "$(creds_file)" ]; then
+    printf '⚠ Could not parse %s - leaving the file alone.\n' "$(creds_file)"
+  fi
+  if keychain_login; then
+    if security delete-generic-password -s "$KEYCHAIN_SVC" >/dev/null 2>&1; then
+      removed=1
+      printf '✓ Removed the Keychain entry "%s".\n' "$KEYCHAIN_SVC"
+      guard_log "removed Keychain entry ($1)"
+    else
+      printf '⚠ The Keychain entry "%s" exists but could not be removed - delete it in Keychain Access.\n' "$KEYCHAIN_SVC"
+    fi
+  fi
+  return 0
+}
+
+warn_if_hijacked() { # a warning for read-only commands (no state change)
+  if hijack_in_file || keychain_login; then
+    printf '⚠ /login credentials detected - sessions bill THAT account, not the ccswitch token!\n'
+    printf '  Fix: ccswitch doctor --fix   (or switch accounts: ccswitch use <name>)\n'
+  fi
+}
+
+cmd_add() {
+  local name="${1:-}" flag="${2:-}"
+  [ -n "$name" ] || die "usage: ccswitch add <name> [--no-verify]"
+  valid_name "$name" || die "name: letters, digits, _ and - only"
+  local tf; tf=$(token_file "$name")
+  [ -e "$tf" ] && die "account '$name' already exists (remove it: ccswitch remove $name)"
+
+  local tok=""
+  printf 'Paste the token for "%s" (Enter = import the active one from ~/.zshenv): ' "$name" >&2
+  IFS= read -rs tok || true; printf '\n' >&2
+  tok=$(printf '%s' "$tok" | tr -d '[:space:]')   # stray spaces or newlines from the paste
+  if [ -z "$tok" ]; then
+    tok=$(active_token)
+    [ -n "$tok" ] || die "no active token in ~/.zshenv to import"
+    printf 'Importing the active token (%s)\n' "$(mask "$tok")" >&2
+  fi
+  case "$tok" in
+    "$TOKEN_PREFIX"*) : ;;
+    *) die "that does not look like a Claude token (expected the ${TOKEN_PREFIX}… prefix)";;
+  esac
+  local dup; dup=$(name_for_token "$tok")
+  [ -n "$dup" ] && printf 'Note: this token is already stored as "%s" - both entries are the same account.\n' "$dup" >&2
+
+  if [ "$flag" != "--no-verify" ]; then
+    printf 'Checking the token… ' >&2
+    if verify_token "$tok"; then
+      printf '%s\n' "$(probe_label)" >&2
+      save_fingerprint "$name"
+      [ "$PROBE_STATUS" = "limit" ] && printf 'Note: the token is valid, the account is just rate limited right now.\n' >&2
+    else printf '%s\n' "$(probe_label)" >&2; die "the token failed the check (rejected or expired). Skip the check with --no-verify"; fi
+  fi
+  ( umask 177; printf '%s' "$tok" > "$tf" ); chmod 600 "$tf"
+  printf 'Added account "%s" (%s)\n' "$name" "$(mask "$tok")"
+}
+
+cmd_list() {
+  local fast="${1:-}" act actname f n found=0 lab tok
+  act=$(active_token); actname=$(name_for_token "$act")
+  printf 'Accounts (%s):\n' "$STORE"
+  if [ "$fast" != "--fast" ] && [ "${CCSWITCH_SKIP_PROBE:-0}" != "1" ]; then
+    printf '  (checking every account live, ~1 s each - skip it with: ccswitch list --fast)\n'
+  fi
+  for f in "$STORE"/*.token; do
+    [ -e "$f" ] || continue
+    found=1; n=$(basename "$f"); n="${n%.token}"; tok=$(cat "$f")
+    if [ "$fast" = "--fast" ]; then lab=""
+    else probe_token "$tok"; save_fingerprint "$n"; lab="  $(probe_label)"; fi
+    if [ "$n" = "$actname" ]; then printf '  * %-16s %s  [ACTIVE]%s\n' "$n" "$(mask "$tok")" "$lab"
+    else printf '    %-16s %s%s\n' "$n" "$(mask "$tok")" "$lab"; fi
+  done
+  [ "$found" = 1 ] || printf '  (none yet - add one: ccswitch add <name>)\n'
+  if [ -n "$act" ] && [ -z "$actname" ]; then
+    printf '  Note: the active token (%s) is not managed by ccswitch.\n' "$(mask "$act")"
+  fi
+  warn_if_hijacked
+}
+
+cmd_use() {
+  local name="" keep_login=0 a
+  for a in "$@"; do
+    case "$a" in
+      --keep-login) keep_login=1;;
+      -*) die "unknown flag: $a (usage: ccswitch use <name> [--keep-login])";;
+      *) name="$a";;
+    esac
+  done
+  [ -n "$name" ] || die "usage: ccswitch use <name> [--keep-login]"
+  local tf; tf=$(token_file "$name")
+  [ -e "$tf" ] || die "no such account '$name' (see: ccswitch list)"
+  write_active "$(cat "$tf")"
+  printf 'Active account: %s\n' "$name"
+
+  # /login credentials would override this switch, so clean them up unless --keep-login
+  if [ "$keep_login" = 1 ]; then
+    if hijack_in_file || keychain_login; then
+      printf '⚠ --keep-login: keeping the /login credentials - THEY win over the token!\n'
+    fi
+  else
+    if hijack_in_file || keychain_login; then
+      fix_login_credentials "use $name"
+      local lr; lr=$(long_running_claudes) || lr=""
+      if [ -n "$lr" ]; then
+        printf '⚠ Long-running claude sessions can bring the credentials back (about every 8h):\n'
+        printf '%s\n' "$lr" | awk -F'\t' '{printf "    pid %s  running %s  %s\n", $1, $2, $3}'
+        printf '  The guard (ccswitch guard on) cleans that up automatically; restarting those sessions ends it for good.\n'
+      fi
+    fi
+  fi
+
+  printf 'Checking the account… ' >&2
+  probe_token "$(cat "$tf")"
+  save_fingerprint "$name"
+  printf '%s\n' "$(probe_label)" >&2
+  if [ "$PROBE_STATUS" = "limit" ]; then
+    printf '⚠ The switch WORKED, but this account is rate limited right now%s.\n' "${PROBE_MSG:+ (${PROBE_MSG})}"
+    printf '  Claude will refuse until it resets. Check the other accounts: ccswitch list\n'
+  elif [ "$PROBE_STATUS" = "fail" ]; then
+    printf '⚠ This account token does not authenticate (rejected or expired?). Mint a new one: claude setup-token\n'
+  fi
+  printf '→ Open a NEW Claude session (new tmux window or a restart) for this to take effect.\n'
+  printf '  (current sessions stay on the previous account until they restart)\n'
+  printf 'Note: /status in Claude shows the /login account, NOT the token account - do not trust it here.\n'
+}
+
+cmd_current() {
+  local act actname
+  act=$(active_token)
+  if [ -z "$act" ]; then
+    printf 'No %s in ~/.zshenv.\n' "$VAR"
+    warn_if_hijacked
+    return
+  fi
+  actname=$(name_for_token "$act")
+  if [ -n "$actname" ]; then printf 'Active account: %s (%s)\n' "$actname" "$(mask "$act")"
+  else printf 'Active token: %s (not managed by ccswitch)\n' "$(mask "$act")"; fi
+  warn_if_hijacked
+  printf 'Checking availability… ' >&2
+  probe_token "$act"
+  save_fingerprint "$actname"
+  printf '%s\n' "$(probe_label)" >&2
+}
+
+cmd_fingerprint() { # refresh every account's fingerprint (quiet; meant for background use)
+  local maxage="" lock="$STORE/.fp.lock" now mt f n
+  if [ "${1:-}" = "--if-stale" ]; then maxage="${2:-21600}"; fi
+  now=$(date +%s)
+  if [ -n "$maxage" ] && [ -f "$FP_FILE" ]; then
+    mt=$(stat -f %m "$FP_FILE" 2>/dev/null) || mt=0
+    [ $(( now - mt )) -lt "$maxage" ] && return 0
+  fi
+  if [ -d "$lock" ]; then # a stale lock (>10 min) left by a killed process
+    mt=$(stat -f %m "$lock" 2>/dev/null) || mt=0
+    [ $(( now - mt )) -gt 600 ] && rmdir "$lock" 2>/dev/null || true
+  fi
+  mkdir "$lock" 2>/dev/null || return 0   # someone else is already refreshing
+  for f in "$STORE"/*.token; do
+    [ -e "$f" ] || continue
+    n=$(basename "$f"); n="${n%.token}"
+    probe_token "$(cat "$f")"
+    save_fingerprint "$n"
+  done
+  rmdir "$lock" 2>/dev/null || true
+}
+
+cmd_remove() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: ccswitch remove <name>"
+  local tf; tf=$(token_file "$name")
+  [ -e "$tf" ] || die "no such account '$name'"
+  printf 'Remove account "%s"? [y/N] ' "$name" >&2
+  local ans; IFS= read -r ans || true
+  case "$ans" in y|Y|yes|Yes) rm -f "$tf"; printf 'Removed "%s".\n' "$name";; *) printf 'Cancelled.\n';; esac
+}
+
+cmd_guard_run() { # the quiet launchd mode: strip on every reappearance of the credentials
+  local bp rc=0
+  bp=$(strip_credentials) || rc=$?
+  case "$rc" in
+    0) guard_log "guard-run: stripped claudeAiOauth; backup: $bp"
+       notify "ccswitch guard: removed the /login credentials that came back in ~/.claude/.credentials.json. New sessions go back to the ccswitch account. The source is usually a long-running claude session - see: ccswitch doctor";;
+    3) [ -f "$(creds_file)" ] && guard_log "guard-run: credentials file unreadable - left alone";;
+  esac
+  return 0
+}
+
+cmd_guard() { # manage the launchd guard
+  local sub="${1:-status}" uid; uid=$(id -u)
+  case "$sub" in
+    on)
+      mkdir -p "$(dirname "$GUARD_PLIST")"
+      cat > "$GUARD_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$GUARD_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$SELF</string>
+    <string>guard-run</string>
+  </array>
+  <key>WatchPaths</key>
+  <array><string>$(creds_file)</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$STORE/guard-launchd.log</string>
+  <key>StandardErrorPath</key><string>$STORE/guard-launchd.log</string>
+</dict>
+</plist>
+EOF
+      launchctl bootout "gui/$uid/$GUARD_LABEL" >/dev/null 2>&1 || true
+      launchctl bootstrap "gui/$uid" "$GUARD_PLIST" || die "launchctl bootstrap failed (plist: $GUARD_PLIST)"
+      printf '✓ Guard enabled (%s).\n' "$GUARD_LABEL"
+      printf '  Watching: %s - removes a returning claudeAiOauth, keeps mcpOAuth.\n' "$(creds_file)"
+      printf '  Log: %s\n' "$GUARD_LOG";;
+    off)
+      launchctl bootout "gui/$uid/$GUARD_LABEL" >/dev/null 2>&1 || true
+      [ -f "$GUARD_PLIST" ] && mv "$GUARD_PLIST" "$GUARD_PLIST.disabled"
+      printf '✓ Guard disabled (plist -> %s.disabled).\n' "$GUARD_PLIST";;
+    status)
+      if launchctl print "gui/$uid/$GUARD_LABEL" >/dev/null 2>&1; then
+        printf 'Guard: ENABLED (%s)\n' "$GUARD_LABEL"
+      elif [ -f "$GUARD_PLIST" ]; then
+        printf 'Guard: the plist exists but is NOT loaded - enable it: ccswitch guard on\n'
+      else
+        printf 'Guard: disabled - enable it: ccswitch guard on\n'
+      fi
+      if [ -f "$GUARD_LOG" ]; then printf 'Recent actions:\n'; tail -5 "$GUARD_LOG" | sed 's/^/  /'; fi;;
+    *) die "usage: ccswitch guard on|off|status";;
+  esac
+}
+
+cmd_doctor() {
+  local fix=0 problems=0 act actname n f perm
+  [ "${1:-}" = "--fix" ] && fix=1
+  printf 'ccswitch doctor - is account switching actually going to hold?\n\n'
+
+  # 1. /login credentials (the file)
+  if hijack_in_file; then
+    if [ "$fix" = 1 ]; then
+      fix_login_credentials "doctor --fix"
+      hijack_in_file && { problems=1; printf '✗ claudeAiOauth is still in the credentials file!\n'; }
+    else
+      problems=1
+      printf '✗ %s holds /login credentials - sessions bill THAT account, not the ccswitch token.\n' "$(creds_file)"
+      printf '  Fix: ccswitch doctor --fix\n'
+    fi
+  else
+    printf '✓ Credentials file has no claudeAiOauth (mcpOAuth may stay - that is MCP server OAuth).\n'
+  fi
+
+  # 2. /login credentials (the Keychain)
+  if keychain_login; then
+    if [ "$fix" = 1 ]; then
+      fix_login_credentials "doctor --fix (keychain)"
+      keychain_login && { problems=1; printf '✗ The Keychain entry is still there.\n'; }
+    else
+      problems=1
+      printf '✗ The Keychain holds "%s" (left by /login) - it wins over the token. Fix: ccswitch doctor --fix\n' "$KEYCHAIN_SVC"
+    fi
+  else
+    printf '✓ Keychain has no "%s" entry.\n' "$KEYCHAIN_SVC"
+  fi
+
+  # 3. the token in zshenv
+  act=$(active_token)
+  if [ -z "$act" ]; then
+    problems=1
+    printf '✗ No %s in %s - pick an account: ccswitch use <name>\n' "$VAR" "$ZSHENV"
+  else
+    actname=$(name_for_token "$act")
+    if [ -n "$actname" ]; then
+      printf '✓ The active token in zshenv is account "%s" (%s).\n' "$actname" "$(mask "$act")"
+    else
+      printf '⚠ The token in zshenv (%s) matches no ccswitch account - add it: ccswitch add <name>\n' "$(mask "$act")"
+    fi
+    case "$act" in
+      "$TOKEN_PREFIX"*) : ;;
+      *) problems=1; printf '✗ The token in zshenv does not look like a Claude token (%s… prefix).\n' "$TOKEN_PREFIX";;
+    esac
+  fi
+
+  # 4. permissions
+  perm=$(stat -f %Lp "$STORE" 2>/dev/null) || perm=""
+  if [ "$perm" != "700" ]; then
+    if [ "$fix" = 1 ]; then chmod 700 "$STORE" && printf '✓ Fixed the permissions on %s -> 700.\n' "$STORE"
+    else printf '⚠ %s is %s (should be 700) - ccswitch doctor --fix\n' "$STORE" "${perm:-?}"; fi
+  fi
+  for f in "$STORE"/*.token; do
+    [ -e "$f" ] || continue
+    perm=$(stat -f %Lp "$f" 2>/dev/null) || perm=""
+    if [ "$perm" != "600" ]; then
+      if [ "$fix" = 1 ]; then chmod 600 "$f" && printf '✓ Fixed the permissions on %s -> 600.\n' "$f"
+      else printf '⚠ %s is %s (should be 600) - ccswitch doctor --fix\n' "$f" "${perm:-?}"; fi
+    fi
+  done
+  if [ -f "$ZSHENV" ]; then
+    perm=$(stat -f %Lp "$ZSHENV" 2>/dev/null) || perm=""
+    if [ "$perm" != "600" ]; then
+      if [ "$fix" = 1 ]; then chmod 600 "$ZSHENV" && printf '✓ Fixed the permissions on %s -> 600.\n' "$ZSHENV"
+      else printf '⚠ %s is %s (should be 600) - ccswitch doctor --fix\n' "$ZSHENV" "${perm:-?}"; fi
+    fi
+  fi
+
+  # 5. probe the active token
+  if [ -n "$act" ] && [ "${CCSWITCH_SKIP_PROBE:-0}" != "1" ]; then
+    printf 'Checking the active token… '
+    probe_token "$act"
+    [ -n "${actname:-}" ] && save_fingerprint "$actname"
+    printf '%s\n' "$(probe_label)"
+    [ "$PROBE_STATUS" = "fail" ] && { problems=1; printf '✗ The active token does not authenticate - mint a new one: claude setup-token, then ccswitch add\n'; }
+  fi
+
+  # 6. long-running claude sessions (the usual source of returning credentials)
+  local lr; lr=$(long_running_claudes) || lr=""
+  if [ -n "$lr" ]; then
+    printf 'Long-running claude sessions (>8h) - if one of them started on a /login account,\n'
+    printf '  it rewrites the credentials about every 8h (the guard cleans that; a restart ends it):\n'
+    printf '%s\n' "$lr" | awk -F'\t' '{printf "    pid %s  running %s  %s\n", $1, $2, $3}'
+  fi
+
+  # 7. the guard
+  if launchctl print "gui/$(id -u)/$GUARD_LABEL" >/dev/null 2>&1; then
+    printf '✓ launchd guard is active (%s).\n' "$GUARD_LABEL"
+  else
+    printf '⚠ Guard is off - credentials can come back unnoticed. Enable it: ccswitch guard on\n'
+  fi
+
+  # 8. fingerprint freshness (anything reading fingerprints.json identifies the account by them)
+  if [ -f "$FP_FILE" ]; then
+    local mt now age
+    mt=$(stat -f %m "$FP_FILE" 2>/dev/null) || mt=0
+    now=$(date +%s); age=$(( now - mt ))
+    if [ "$age" -gt 86400 ]; then
+      printf '⚠ fingerprints.json is %sh old - account identification will be guesswork. Refresh: ccswitch fingerprint\n' "$(( age / 3600 ))"
+    else
+      printf '✓ fingerprints.json is fresh (%s min).\n' "$(( age / 60 ))"
+    fi
+  else
+    printf '⚠ No fingerprints.json - nothing can tell which account a session bills. Build it: ccswitch fingerprint\n'
+  fi
+
+  printf '\n'
+  if [ "$problems" = 0 ]; then printf 'Verdict: HEALTHY - new sessions will use the ccswitch account.\n'; return 0
+  else printf 'Verdict: PROBLEMS - see the ✗ lines above.\n'; return 1; fi
+}
+
+usage() {
+  cat <<EOF
+ccswitch - a Claude Code account switcher (through $VAR)
+
+  ccswitch add <name> [--no-verify]    add an account (paste a token; Enter = import the active one)
+  ccswitch list [--fast]               list accounts + a live check (OK/LIMIT/FAILED); --fast skips the check
+  ccswitch use <name> [--keep-login]   set the account for NEW sessions (+ check; strips /login credentials)
+  ccswitch current                     show the active account (+ check)
+  ccswitch doctor [--fix]              full reliability check; --fix repairs what it can
+  ccswitch guard on|off|status         launchd guard: auto-remove returning /login credentials
+  ccswitch remove <name>               remove an account
+  ccswitch fingerprint [--if-stale <s>]  refresh account fingerprints (limit resets) in fingerprints.json
+  ccswitch help                        this help
+
+LIMIT on an account means the token works and the account is merely out of quota
+right now (quota is per account: claude.ai in a browser and other machines burn
+the same pool).
+/status in Claude shows the /login account, NOT the token account - trust ccswitch.
+
+The /login credentials (~/.claude/.credentials.json + Keychain) BEAT the token and
+come back about every 8h through long-running claude sessions. 'use' and
+'doctor --fix' remove them surgically (MCP server OAuth is kept), and the guard
+('guard on') watches the file 24/7.
+
+Tokens: $STORE/<name>.token (600).  Active token: ~/.zshenv (backup: $STORE/zshenv.bak).
+Credential backups: $BACKUP_DIR/ (last 10).  Guard log: $GUARD_LOG.
+New account: 'claude setup-token' (log into the right account in the browser) -> copy the token -> 'ccswitch add <name>'.
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    add)              cmd_add "$@";;
+    list|ls)          cmd_list "$@";;
+    use|switch)       cmd_use "$@";;
+    current|status)   cmd_current "$@";;
+    remove|rm)        cmd_remove "$@";;
+    fingerprint|fp)   cmd_fingerprint "$@";;
+    doctor|dr)        cmd_doctor "$@";;
+    guard)            cmd_guard "$@";;
+    guard-run)        cmd_guard_run "$@";;
+    help|-h|--help)   usage;;
+    *) err "unknown command: $cmd"; usage; exit 1;;
+  esac
+}
+main "$@"

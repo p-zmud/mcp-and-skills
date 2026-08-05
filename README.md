@@ -55,6 +55,7 @@ Standalone command line tools, usually paired with a skill that teaches Claude t
 
 | Tool | What it does | Install |
 | ---- | ------------ | ------- |
+| [ccswitch](cli/ccswitch) | Switches Claude Code accounts through `CLAUDE_CODE_OAUTH_TOKEN`, no Keychain, works headless - and handles the part that makes it hard: the `/login` credentials that override the token and come back every 8 hours. **Portfolio only** - code to read and copy, not a `/plugin install`, because it rewrites `~/.zshenv` and edits `~/.claude/.credentials.json` | read [the README](cli/ccswitch) first |
 | [purelymail](cli/purelymail) | `pmail` - one stdlib-only Python CLI for both halves of Purelymail: read, search, send and reply over IMAP/SMTP, plus domains, mailboxes, aliases and app passwords over API v0 | `/plugin install purelymail@pzmud` |
 
 ## Repo layout
