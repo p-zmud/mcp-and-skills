@@ -10,6 +10,11 @@ mcp/<name>/
 └── skills/<name>/        optional - skill teaching Claude the server's flow and gotchas
 ```
 
+An entry may also ship a prebuilt `.mcpb` bundle instead of a plugin: that is the Claude Desktop
+extension format, installed by double-clicking the file rather than through `/plugin`. Such an
+entry stays out of `.claude-plugin/marketplace.json` and says so in its own `README.md`, because
+`/plugin install` cannot do anything with it.
+
 Never commit tokens. Reference them as `${VAR}` in `.mcp.json` and document the required
 environment variables in the entry's own `README.md`, with an `.env.example` if useful.
 

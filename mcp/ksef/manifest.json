@@ -1,0 +1,73 @@
+{
+  "manifest_version": "0.3",
+  "name": "ksef-mcp",
+  "display_name": "KSeF - Krajowy System e-Faktur",
+  "version": "0.1.0",
+  "description": "Wystawianie i pobieranie faktur w KSeF, uprawnienia, certyfikaty i tokeny - wprost z rozmowy z Claude.",
+  "long_description": "Pełna obsługa KSeF API 2.0: wszystkie 83 operacje w 54 narzędziach. Wystawianie faktur FA(3), pobieranie faktur i UPO, kwerendy metadanych, nadawanie uprawnień, certyfikaty KSeF, tokeny, kody QR i tryby offline.\n\nWażne: treści faktur, o które poprosisz, trafiają do kontekstu modelu, czyli do Anthropic. Dotyczy to również danych kontrahentów. Szczegóły w dokumencie bezpieczenstwo.md dołączonym do paczki.",
+  "author": {
+    "name": "p-zmud",
+    "url": "https://github.com/p-zmud/ksef-mcp"
+  },
+  "homepage": "https://github.com/p-zmud/ksef-mcp",
+  "documentation": "https://github.com/p-zmud/ksef-mcp/blob/main/docs/narzedzia.md",
+  "license": "MIT",
+  "keywords": ["ksef", "faktura", "e-faktura", "vat", "ksef-api"],
+  "server": {
+    "type": "node",
+    "entry_point": "server/dist/stdio.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/dist/stdio.js"],
+      "env": {
+        "KSEF_ENV": "${user_config.srodowisko}",
+        "KSEF_NIP": "${user_config.nip}",
+        "KSEF_TOKEN": "${user_config.token}",
+        "KSEF_SCOPE": "${user_config.zakres}",
+        "KSEF_OUTPUT_DIR": "${user_config.katalog_plikow}"
+      }
+    }
+  },
+  "user_config": {
+    "srodowisko": {
+      "type": "string",
+      "title": "Środowisko KSeF",
+      "description": "TEST do nauki i prób (dane fikcyjne), DEMO do testów na prawdziwych poświadczeniach, PRD to produkcja z fakturami ze skutkiem prawnym. Zacznij od TEST.",
+      "default": "TEST",
+      "required": true
+    },
+    "nip": {
+      "type": "string",
+      "title": "NIP podmiotu",
+      "description": "10 cyfr, bez myślników. To NIP firmy, w której imieniu działasz.",
+      "required": true
+    },
+    "token": {
+      "type": "string",
+      "title": "Token KSeF",
+      "description": "Wygenerujesz go w aplikacji KSeF (zakładka Tokeny) dla wybranego środowiska. Token z TEST nie zadziała na produkcji. Przechowywany jest w keychainie systemu, nie w pliku.",
+      "sensitive": true,
+      "required": true
+    },
+    "zakres": {
+      "type": "string",
+      "title": "Zakres uprawnień w rozmowie",
+      "description": "Wpisz read-only, żeby Claude mógł tylko czytać dane, albo full, żeby mógł też wystawiać faktury i zmieniać uprawnienia. Przy pracy na produkcji rozważ read-only.",
+      "default": "full",
+      "required": true
+    },
+    "katalog_plikow": {
+      "type": "directory",
+      "title": "Katalog na pliki",
+      "description": "Tu trafią duże pliki: XML faktur, UPO, wygenerowane PDF-y i klucze certyfikatów. Domyślnie katalog .ksef-mcp w Twoim folderze domowym.",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=20.0.0"
+    }
+  }
+}

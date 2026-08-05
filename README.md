@@ -46,6 +46,7 @@ Model Context Protocol servers exposing external APIs as tools.
 
 | Server | What it does | Install |
 | ------ | ------------ | ------- |
+| [ksef](mcp/ksef) | KSeF API 2.0, the Polish national e-invoicing system: all 83 API operations in 54 tools - issuing and fetching invoices, metadata queries, permissions, certificates, tokens, QR codes, offline modes. Ships as a prebuilt `.mcpb` bundle for **Claude Desktop**, not as a Claude Code plugin. Entry docs are in Polish | download the [`.mcpb`](mcp/ksef) and double-click it |
 | [raindrop](mcp/raindrop) | The whole Raindrop.io REST API v1 in 50 tools - collections, bookmarks, tags, highlights, filters, sharing, import, backups, export, covers, file upload - with a `confirm` guard on every irreversible, global or outbound operation | `/plugin install raindrop@pzmud` |
 
 ### CLI
