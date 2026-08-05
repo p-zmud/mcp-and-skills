@@ -41,6 +41,20 @@
       ]
     },
     {
+      "name": "dash-guard",
+      "source": "./hooks/dash-guard",
+      "description": "PreToolUse hook that rewrites em and en dashes to a hyphen in .md, .txt and .html through updatedInput, so the write lands corrected on the first try instead of being denied and resent",
+      "category": "hooks",
+      "keywords": [
+        "hook",
+        "typography",
+        "em-dash",
+        "markdown",
+        "autofix",
+        "pretooluse"
+      ]
+    },
+    {
       "name": "purelymail",
       "source": "./cli/purelymail",
       "description": "pmail - stdlib-only Python CLI for Purelymail: mail over IMAP/SMTP plus account administration over API v0, with the skill that teaches Claude to drive it",

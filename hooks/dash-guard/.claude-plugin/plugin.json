@@ -1,0 +1,21 @@
+{
+  "name": "dash-guard",
+  "description": "PreToolUse hook that rewrites em and en dashes to a hyphen in .md, .txt and .html before the write lands, using updatedInput instead of denying. Code blocks and inline code in Markdown are left alone.",
+  "version": "0.1.0",
+  "author": {
+    "name": "p-zmud",
+    "url": "https://github.com/p-zmud"
+  },
+  "homepage": "https://github.com/p-zmud/mcp-and-skills",
+  "repository": "https://github.com/p-zmud/mcp-and-skills",
+  "license": "MIT",
+  "keywords": [
+    "hook",
+    "typography",
+    "em-dash",
+    "markdown",
+    "autofix",
+    "pretooluse"
+  ],
+  "hooks": "./hooks/hooks.json"
+}

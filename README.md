@@ -38,6 +38,7 @@ Shell and Python hooks that fire on Claude Code events, before the tool call run
 
 | Hook | What it does | Install |
 | ---- | ------------ | ------- |
+| [dash-guard](hooks/dash-guard) | Rewrites em and en dashes to a hyphen in `.md`, `.txt` and `.html` through `updatedInput`, so the write lands corrected on the first try instead of being denied and resent. Code blocks and inline code untouched | `/plugin install dash-guard@pzmud` |
 | [big-read-guard](hooks/big-read-guard) | Denies a full `Read` of a text file over 32 KB - the biggest controllable context sink there is - and answers with the size, the token cost and the way out: Grep, then ranged reads. Images and PDFs exempt, explicit `offset`/`limit` passes | `/plugin install big-read-guard@pzmud` |
 
 ### MCP
