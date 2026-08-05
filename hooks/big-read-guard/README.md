@@ -95,3 +95,6 @@ fixtures are generated in a temp directory.
 ## License
 
 MIT - see the [repository root](https://github.com/p-zmud/mcp-and-skills).
+
+Provided as is, with no warranty and no support. Use it at your own risk - the author
+accepts no responsibility for any damage, data loss or other consequence of running it.

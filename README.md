@@ -1,9 +1,8 @@
 # mcp-and-skills
 
-A Claude Code plugin marketplace and portfolio: skills, subagents, MCP servers and CLI tools,
-built and used in production on a 24/7 Mac Mini automation stack.
+A Claude Code plugin marketplace: skills, subagents, hooks, MCP servers and CLI tools.
 
-Everything here is installable directly in Claude Code.
+Everything listed in the marketplace installs directly in Claude Code.
 
 ## Install
 
@@ -76,6 +75,18 @@ Each `<name>/` directory is a self-contained Claude Code plugin: it holds its ow
 registering it in `.claude-plugin/marketplace.json`.
 
 See [docs/adding-an-entry.md](docs/adding-an-entry.md) for the full checklist.
+
+## Disclaimer
+
+Everything here is provided **as is, with no warranty and no support**, and you use it entirely
+at your own risk. The author accepts no responsibility and no liability for any damage, data
+loss, cost, downtime or other consequence of installing, running or modifying anything in this
+repository.
+
+Some entries do more than answer questions: hooks change what Claude Code is allowed to do,
+`raindrop` writes to a live Raindrop.io account, and `ccswitch` rewrites `~/.zshenv` and edits
+`~/.claude/.credentials.json`. Read an entry's README and its source before you run it, and keep
+your own backups.
 
 ## License
 

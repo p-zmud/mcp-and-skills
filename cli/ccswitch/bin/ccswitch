@@ -626,7 +626,7 @@ the same pool).
 The /login credentials (~/.claude/.credentials.json + Keychain) BEAT the token and
 come back about every 8h through long-running claude sessions. 'use' and
 'doctor --fix' remove them surgically (MCP server OAuth is kept), and the guard
-('guard on') watches the file 24/7.
+('guard on') keeps watching the file in the background.
 
 Tokens: $STORE/<name>.token (600).  Active token: ~/.zshenv (backup: $STORE/zshenv.bak).
 Credential backups: $BACKUP_DIR/ (last 10).  Guard log: $GUARD_LOG.

@@ -6,7 +6,7 @@
     "url": "https://github.com/p-zmud"
   },
   "metadata": {
-    "description": "Skills, subagents, MCP servers and CLI tools for Claude Code - built and used in production by p-zmud",
+    "description": "Skills, subagents, hooks, MCP servers and CLI tools for Claude Code",
     "version": "0.1.0"
   },
   "plugins": [

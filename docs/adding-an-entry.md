@@ -59,7 +59,7 @@ when a script needs an absolute path at runtime.
 
 An entry belongs in this repo when it is:
 
-- **Actually used** - it solves a real problem the author hit, not a demo.
+- **Actually used** - it solves a real problem, not a demo.
 - **Self-contained** - installs and runs without hidden setup outside its own README.
 - **Loud on failure** - no silent fallbacks, no swallowed errors.
 - **Small** - the simplest thing that works, no speculative configurability.

@@ -117,3 +117,6 @@ orzecznictwa; UOKiK, UODO, EDPB, KRRiT, KNF, URPL, GIF i UKE dla stanowisk organ
 ## Licencja
 
 MIT - patrz [korzeń repozytorium](https://github.com/p-zmud/mcp-and-skills).
+
+Bez gwarancji i bez wsparcia, używasz na własną odpowiedzialność - autor nie ponosi
+odpowiedzialności za żadne szkody ani skutki użycia tego agenta.

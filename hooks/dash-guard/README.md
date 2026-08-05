@@ -7,8 +7,8 @@ hyphen in prose files, **before the write lands**, and lets the write through.
 
 The obvious version of this rule is a guard that denies the write and tells the model to try
 again. It works, and it is expensive: every denial costs a full retransmission of the content,
-and long documents get retried several times. Running the original as a deny-style guard racked
-up 187 denials in one session history.
+and a long document can be retried several times before it lands. On any writing-heavy workload
+those denials add up fast, and every one of them buys nothing but a repeated round trip.
 
 `updatedInput` removes the retry entirely. The hook returns the corrected `tool_input`, Claude
 Code writes that version, and the session moves on with a one-line note that the substitution
@@ -111,3 +111,6 @@ every fail-open path.
 ## License
 
 MIT - see the [repository root](https://github.com/p-zmud/mcp-and-skills).
+
+Provided as is, with no warranty and no support. Use it at your own risk - the author
+accepts no responsibility for any damage, data loss or other consequence of running it.
