@@ -55,6 +55,20 @@
       ]
     },
     {
+      "name": "raindrop",
+      "source": "./mcp/raindrop",
+      "description": "MCP server covering the whole Raindrop.io REST API v1 in 50 tools - collections, bookmarks, tags, highlights, filters, sharing, import, backups, export, covers, file upload - with a confirm guard on every destructive or global operation",
+      "category": "mcp",
+      "keywords": [
+        "mcp",
+        "raindrop",
+        "bookmarks",
+        "python",
+        "fastmcp",
+        "rest-api"
+      ]
+    },
+    {
       "name": "purelymail",
       "source": "./cli/purelymail",
       "description": "pmail - stdlib-only Python CLI for Purelymail: mail over IMAP/SMTP plus account administration over API v0, with the skill that teaches Claude to drive it",

@@ -47,6 +47,7 @@ Model Context Protocol servers exposing external APIs as tools.
 
 | Server | What it does | Install |
 | ------ | ------------ | ------- |
+| [raindrop](mcp/raindrop) | The whole Raindrop.io REST API v1 in 50 tools - collections, bookmarks, tags, highlights, filters, sharing, import, backups, export, covers, file upload - with a `confirm` guard on every irreversible, global or outbound operation | `/plugin install raindrop@pzmud` |
 
 ### CLI
 

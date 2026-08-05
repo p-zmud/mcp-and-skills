@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "raindrop": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory", "${CLAUDE_PLUGIN_ROOT}",
+        "--with", "mcp>=1.2,<2",
+        "--with", "requests",
+        "--with", "python-dotenv",
+        "python", "-m", "src.mcp_server"
+      ],
+      "env": {
+        "RAINDROP_TOKEN": "${RAINDROP_TOKEN}"
+      }
+    }
+  }
+}
