@@ -25,6 +25,21 @@
         "marketing",
         "audit"
       ]
+    },
+    {
+      "name": "purelymail",
+      "source": "./cli/purelymail",
+      "description": "pmail - stdlib-only Python CLI for Purelymail: mail over IMAP/SMTP plus account administration over API v0, with the skill that teaches Claude to drive it",
+      "category": "cli",
+      "keywords": [
+        "email",
+        "purelymail",
+        "imap",
+        "smtp",
+        "cli",
+        "mailbox",
+        "python"
+      ]
     }
   ]
 }

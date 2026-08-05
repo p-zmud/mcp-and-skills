@@ -1,0 +1,21 @@
+{
+  "name": "purelymail",
+  "description": "pmail - a stdlib-only Python CLI for Purelymail: read, search, send and reply to mail over IMAP/SMTP, plus account administration over API v0. Ships the skill that teaches Claude to drive it.",
+  "version": "0.1.0",
+  "author": {
+    "name": "p-zmud",
+    "url": "https://github.com/p-zmud"
+  },
+  "homepage": "https://github.com/p-zmud/mcp-and-skills",
+  "repository": "https://github.com/p-zmud/mcp-and-skills",
+  "license": "MIT",
+  "keywords": [
+    "email",
+    "purelymail",
+    "imap",
+    "smtp",
+    "cli",
+    "mailbox",
+    "python"
+  ]
+}

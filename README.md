@@ -45,6 +45,7 @@ Standalone command line tools, usually paired with a skill that teaches Claude t
 
 | Tool | What it does | Install |
 | ---- | ------------ | ------- |
+| [purelymail](cli/purelymail) | `pmail` - one stdlib-only Python CLI for both halves of Purelymail: read, search, send and reply over IMAP/SMTP, plus domains, mailboxes, aliases and app passwords over API v0 | `/plugin install purelymail@pzmud` |
 
 ## Repo layout
 

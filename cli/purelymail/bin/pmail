@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+"""
+pmail - a CLI for Purelymail: mail (IMAP/SMTP) plus account administration (API v0).
+Standalone, stdlib-only: no pip, no virtualenv.
+
+Two layers, because that is how Purelymail splits things:
+  * API v0 (https://purelymail.com/api/v0/*, POST + Purelymail-Api-Token header) covers ONLY
+    account administration: domains, users, routing rules (aliases), app passwords, credit.
+    It can NOT read, search or send mail.
+  * Message content is reachable only over IMAP (imap.purelymail.com:993 SSL) and SMTP
+    (smtp.purelymail.com:465 SSL), using an app password minted by createAppPassword.
+
+Config: ~/.config/pmail/config.json (chmod 600, directory 700), written by `pmail setup`:
+  {"api_token": "...", "default_mailbox": "you@example.com", "mailboxes": {"addr": "app_password"}}
+$PMAIL_CONFIG overrides the path (used by the tests).
+
+Output: UTF-8 JSON on stdout. Exception: `read` prints human-readable text (--json = structure).
+Errors: message on stderr, exit 2. Destructive operations require --yes.
+"""
+import argparse
+import email
+import email.utils
+import imaplib
+import json
+import mimetypes
+import os
+import smtplib
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+from email.header import decode_header, make_header
+from email.message import EmailMessage
+from html.parser import HTMLParser
+
+API_BASE = "https://purelymail.com/api/v0"
+IMAP_HOST = "imap.purelymail.com"   # verified live 2026-08-05
+IMAP_PORT = 993
+SMTP_HOST = "smtp.purelymail.com"
+SMTP_PORT = 465
+SENT_FOLDER = "Sent"    # Dovecot folders on the account: INBOX, Sent, Drafts, Trash, Junk, Archive
+TRASH_FOLDER = "Trash"
+DEFAULT_CONFIG = os.path.expanduser("~/.config/pmail/config.json")
+
+
+def die(msg):
+    sys.stderr.write("pmail: %s\n" % msg)
+    sys.exit(2)
+
+
+def out(obj):
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+# ---------------------------------------------------------------- config
+
+def _config_path():
+    return os.environ.get("PMAIL_CONFIG") or DEFAULT_CONFIG
+
+
+def _load_config(required=True):
+    path = _config_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        if required:
+            die("no config at %s - run this first: pmail setup --token <API_TOKEN>" % path)
+        return {"mailboxes": {}}
+    except ValueError as e:
+        die("corrupted config %s: %s" % (path, e))
+
+
+def _save_config(cfg):
+    path = _config_path()
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, 0o700)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.chmod(path, 0o600)
+
+
+def _token(cfg):
+    t = cfg.get("api_token")
+    if not t:
+        die("config has no api_token - run: pmail setup --token <API_TOKEN>")
+    return t
+
+
+def _mailbox(cfg, arg):
+    """Mailbox address plus its app password; --mailbox overrides default_mailbox."""
+    addr = arg or cfg.get("default_mailbox")
+    if not addr:
+        die("no mailbox selected - pass --mailbox <address> or set a default with: "
+            "pmail setup --default <address>")
+    boxes = cfg.get("mailboxes") or {}
+    if addr not in boxes:
+        die("mailbox %s has no app password in the config (known: %s) - run: pmail setup "
+            "--token <API_TOKEN>" % (addr, ", ".join(sorted(boxes)) or "none"))
+    return addr, boxes[addr]
+
+
+# ---------------------------------------------------------------- API v0
+
+def api_call(token, operation, body=None):
+    """POST to /api/v0/<operation>. Returns the 'result' payload. An API error dies (exit 2)."""
+    data = json.dumps(body or {}).encode("utf-8")
+    req = urllib.request.Request(
+        "%s/%s" % (API_BASE, operation), data=data, method="POST",
+        headers={"Purelymail-Api-Token": token, "Content-Type": "application/json"})
+    try:
+        raw = urllib.request.urlopen(req, timeout=60).read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            die("HTTP %s from Purelymail (%s): %s" % (e.code, operation, raw[:400]))
+        die("API %s: %s (%s)" % (operation, parsed.get("message", raw[:300]), parsed.get("code")))
+    except urllib.error.URLError as e:
+        die("cannot reach purelymail.com (%s): %s" % (operation, e))
+    try:
+        parsed = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        die("invalid JSON from Purelymail (%s): %s" % (operation, raw[:300]))
+    if parsed.get("type") == "error":
+        die("API %s: %s (%s)" % (operation, parsed.get("message"), parsed.get("code")))
+    return parsed.get("result", {})
+
+
+# ---------------------------------------------------------------- IMAP / SMTP
+
+def imap_connect(addr, app_password, folder=None, readonly=False):
+    try:
+        M = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ssl.create_default_context())
+        M.login(addr, app_password)
+    except (imaplib.IMAP4.error, OSError) as e:
+        die("IMAP login as %s failed: %s" % (addr, e))
+    if folder:
+        typ, data = M.select(_quote_folder(folder), readonly=readonly)
+        if typ != "OK":
+            M.logout()
+            die("cannot open folder %r: %s" % (folder, _first(data)))
+    return M
+
+
+def _quote_folder(name):
+    return '"%s"' % name.replace('"', '\\"')
+
+
+def _first(data):
+    if not data:
+        return ""
+    x = data[0]
+    return x.decode("utf-8", "replace") if isinstance(x, bytes) else str(x)
+
+
+def _check(typ, data, what):
+    if typ != "OK":
+        die("IMAP: %s failed: %s" % (what, _first(data)))
+    return data
+
+
+def smtp_send(addr, app_password, msg):
+    try:
+        S = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=60,
+                             context=ssl.create_default_context())
+        S.login(addr, app_password)
+        S.send_message(msg)
+        S.quit()
+    except (smtplib.SMTPException, OSError) as e:
+        die("SMTP send as %s failed: %s" % (addr, e))
+
+
+def append_to_sent(addr, app_password, msg):
+    """Without APPEND a sent message leaves no trace in the mailbox - Purelymail will not do it."""
+    M = imap_connect(addr, app_password)
+    try:
+        typ, data = M.append(_quote_folder(SENT_FOLDER), r"\Seen",
+                             imaplib.Time2Internaldate(time.time()), msg.as_bytes())
+        if typ != "OK":
+            die("message sent, but APPEND to %s failed: %s" % (SENT_FOLDER, _first(data)))
+    finally:
+        M.logout()
+
+
+# ---------------------------------------------------------------- message parsing
+
+def dec(value):
+    """MIME header -> plain text (non-ASCII in Subject/From)."""
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except (UnicodeDecodeError, LookupError, ValueError):
+        return value
+
+
+class _Stripper(HTMLParser):
+    def __init__(self):
+        HTMLParser.__init__(self)
+        self.parts = []
+        self.skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.skip += 1
+        elif tag in ("p", "br", "div", "tr", "li"):
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self.skip:
+            self.skip -= 1
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.parts.append(data)
+
+    def text(self):
+        lines = [ln.strip() for ln in "".join(self.parts).splitlines()]
+        return "\n".join([ln for ln in lines if ln])
+
+
+def html_to_text(html):
+    p = _Stripper()
+    p.feed(html)
+    p.close()
+    return p.text()
+
+
+def _payload_text(part):
+    raw = part.get_payload(decode=True) or b""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return raw.decode(charset, "replace")
+    except LookupError:
+        return raw.decode("utf-8", "replace")
+
+
+def body_and_attachments(msg):
+    """Prefer text/plain; for HTML-only mail strip the tags. Returns (text, [attachment names])."""
+    plain, html, attachments = [], [], []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        disp = (part.get("Content-Disposition") or "").lower()
+        filename = part.get_filename()
+        if "attachment" in disp or (filename and part.get_content_maintype() != "text"):
+            attachments.append(dec(filename) or "(unnamed)")
+            continue
+        ctype = part.get_content_type()
+        if ctype == "text/plain":
+            plain.append(_payload_text(part))
+        elif ctype == "text/html":
+            html.append(_payload_text(part))
+    text = "\n".join(plain).strip() or html_to_text("\n".join(html)).strip()
+    return text, attachments
+
+
+def header_row(uid, raw_headers, flags):
+    msg = email.message_from_bytes(raw_headers)
+    return {
+        "uid": uid,
+        "from": dec(msg.get("From")),
+        "to": dec(msg.get("To")),
+        "subject": dec(msg.get("Subject")),
+        "date": dec(msg.get("Date")),
+        "flags": flags,
+        "unread": "\\Seen" not in flags,
+    }
+
+
+def _parse_fetch(data):
+    """UID FETCH response -> [(uid, bytes, [flags])]. imaplib returns a flat list where the real
+    payload sits in (metadata, body) tuples and the closing ')' arrives as a bare byte string."""
+    rows = []
+    for item in data:
+        if not isinstance(item, tuple):
+            continue
+        meta = item[0].decode("utf-8", "replace") if isinstance(item[0], bytes) else str(item[0])
+        uid = None
+        if "UID " in meta:
+            digits = ""
+            for ch in meta.split("UID ", 1)[1]:
+                if ch.isdigit():
+                    digits += ch
+                else:
+                    break
+            uid = int(digits) if digits else None
+        flags = []
+        if "FLAGS (" in meta:
+            flags = meta.split("FLAGS (", 1)[1].split(")", 1)[0].split()
+        rows.append((uid, item[1] or b"", flags))
+    return rows
+
+
+def fetch_headers(M, uids):
+    if not uids:
+        return []
+    typ, data = M.uid("FETCH", ",".join(str(u) for u in uids),
+                      "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])")
+    _check(typ, data, "header FETCH")
+    rows = [header_row(uid, raw, flags) for uid, raw, flags in _parse_fetch(data) if uid]
+    order = {u: i for i, u in enumerate(uids)}
+    rows.sort(key=lambda r: order.get(r["uid"], 0))
+    return rows
+
+
+def fetch_message(M, uid):
+    typ, data = M.uid("FETCH", str(uid), "(FLAGS BODY.PEEK[])")
+    _check(typ, data, "FETCH of message %s" % uid)
+    rows = _parse_fetch(data)
+    if not rows or not rows[0][1]:
+        die("no message with UID %s in this folder" % uid)
+    return email.message_from_bytes(rows[0][1]), rows[0][2]
+
+
+def uid_search(M, criteria, utf8_literal=None):
+    """UID SEARCH. Purelymail (Dovecot) rejects CHARSET UTF-8 when the phrase is a plain argument
+    but accepts it as an IMAP literal - hence the separate path for non-ASCII phrases."""
+    if utf8_literal is not None:
+        M.literal = utf8_literal.encode("utf-8")
+        typ, data = M.uid("SEARCH", "CHARSET", "UTF-8", *criteria)
+    else:
+        typ, data = M.uid("SEARCH", None, *criteria)
+    _check(typ, data, "SEARCH")
+    return [int(x) for x in _first(data).split()]
+
+
+# ---------------------------------------------------------------- commands: mail
+
+def cmd_folders(cfg, a):
+    addr, pw = _mailbox(cfg, a.mailbox)
+    M = imap_connect(addr, pw)
+    try:
+        typ, data = M.list()
+        _check(typ, data, "folder LIST")
+        folders = []
+        for line in data:
+            line = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+            name = line.rsplit(' "', 1)[-1].strip('"') if '"' in line else line.split()[-1]
+            attrs = line.split("(", 1)[1].split(")", 1)[0].split() if "(" in line else []
+            folders.append({"name": name, "attrs": attrs})
+    finally:
+        M.logout()
+    out({"mailbox": addr, "folders": folders})
+
+
+def cmd_inbox(cfg, a):
+    addr, pw = _mailbox(cfg, a.mailbox)
+    M = imap_connect(addr, pw, a.folder, readonly=True)
+    try:
+        uids = uid_search(M, ["UNSEEN"] if a.unread else ["ALL"])
+        uids = uids[-a.n:][::-1]     # newest first
+        rows = fetch_headers(M, uids)
+    finally:
+        M.logout()
+    out({"mailbox": addr, "folder": a.folder, "count": len(rows), "messages": rows})
+
+
+def _imap_date(s):
+    """YYYY-MM-DD -> DD-Mon-YYYY (the only date format IMAP SEARCH understands)."""
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    try:
+        y, m, d = s.split("-")
+        return "%02d-%s-%s" % (int(d), months[int(m) - 1], y)
+    except (ValueError, IndexError):
+        die("date %r has the wrong format - use YYYY-MM-DD" % s)
+
+
+def cmd_search(cfg, a):
+    addr, pw = _mailbox(cfg, a.mailbox)
+    criteria, literal = [], None
+    if a.from_:
+        if not a.from_.isascii():
+            die("--from with non-ASCII characters will not pass through IMAP SEARCH - give the bare address")
+        criteria += ["FROM", '"%s"' % a.from_]
+    if a.since:
+        criteria += ["SINCE", _imap_date(a.since)]
+    if a.query:
+        if a.query.isascii():
+            criteria += ["TEXT", '"%s"' % a.query]
+        else:
+            criteria += ["TEXT"]     # the phrase travels as a literal and has to be the last argument
+            literal = a.query
+    if not criteria:
+        criteria = ["ALL"]
+    M = imap_connect(addr, pw, a.folder, readonly=True)
+    try:
+        uids = uid_search(M, criteria, literal)
+        uids = uids[-a.n:][::-1]
+        rows = fetch_headers(M, uids)
+    finally:
+        M.logout()
+    out({"mailbox": addr, "folder": a.folder, "query": a.query, "count": len(rows),
+         "messages": rows})
+
+
+def cmd_read(cfg, a):
+    addr, pw = _mailbox(cfg, a.mailbox)
+    M = imap_connect(addr, pw, a.folder, readonly=True)
+    try:
+        msg, flags = fetch_message(M, a.uid)
+    finally:
+        M.logout()
+    text, attachments = body_and_attachments(msg)
+    data = {
+        "uid": a.uid, "folder": a.folder,
+        "from": dec(msg.get("From")), "to": dec(msg.get("To")), "cc": dec(msg.get("Cc")),
+        "subject": dec(msg.get("Subject")), "date": dec(msg.get("Date")),
+        "message_id": msg.get("Message-ID"), "flags": flags,
+        "attachments": attachments, "body": text,
+    }
+    if a.json:
+        out(data)
+        return
+    print("From:    %s" % data["from"])
+    print("To:      %s" % data["to"])
+    if data["cc"]:
+        print("Cc:      %s" % data["cc"])
+    print("Date:    %s" % data["date"])
+    print("Subject: %s" % data["subject"])
+    if attachments:
+        print("Attachments: %s" % ", ".join(attachments))
+    print("-" * 60)
+    print(text)
+
+
+def _body(a):
+    if a.body_file:
+        try:
+            with open(a.body_file, encoding="utf-8") as f:
+                return f.read()
+        except OSError as e:
+            die("cannot read --body-file: %s" % e)
+    if a.body is None:
+        die("give a body: --body <text> or --body-file <path>")
+    return a.body
+
+
+def _attach(msg, paths):
+    for p in paths or []:
+        try:
+            with open(p, "rb") as f:
+                payload = f.read()
+        except OSError as e:
+            die("cannot read attachment %s: %s" % (p, e))
+        ctype = mimetypes.guess_type(p)[0] or "application/octet-stream"
+        maintype, subtype = ctype.split("/", 1)
+        msg.add_attachment(payload, maintype=maintype, subtype=subtype,
+                           filename=os.path.basename(p))
+
+
+def _new_message(addr, subject, body_text, attach):
+    msg = EmailMessage()
+    msg["From"] = addr
+    msg["Subject"] = subject
+    msg["Date"] = email.utils.formatdate(localtime=True)
+    msg["Message-ID"] = email.utils.make_msgid(domain=addr.split("@")[-1])
+    msg.set_content(body_text)
+    _attach(msg, attach)
+    return msg
+
+
+def cmd_send(cfg, a):
+    addr, pw = _mailbox(cfg, a.mailbox)
+    msg = _new_message(addr, a.subject, _body(a), a.attach)
+    msg["To"] = ", ".join(a.to)
+    if a.cc:
+        msg["Cc"] = ", ".join(a.cc)
+    smtp_send(addr, pw, msg)
+    append_to_sent(addr, pw, msg)
+    out({"sent": True, "from": addr, "to": a.to, "cc": a.cc or [],
+         "subject": a.subject, "message_id": msg["Message-ID"], "appended_to": SENT_FOLDER})
+
+
+def cmd_reply(cfg, a):
+    addr, pw = _mailbox(cfg, a.mailbox)
+    M = imap_connect(addr, pw, a.folder, readonly=True)
+    try:
+        orig, _flags = fetch_message(M, a.uid)
+    finally:
+        M.logout()
+    to = [e for _n, e in email.utils.getaddresses(
+        [orig.get("Reply-To") or orig.get("From") or ""]) if e]
+    if not to:
+        die("the original (UID %s) has no sender - nobody to reply to" % a.uid)
+    cc = []
+    if a.all:
+        others = email.utils.getaddresses([orig.get("To") or "", orig.get("Cc") or ""])
+        cc = [e for _n, e in others if e and e.lower() != addr.lower() and e not in to]
+    subject = dec(orig.get("Subject")) or ""
+    if not subject.lower().startswith("re:"):
+        subject = "Re: " + subject
+    msg = _new_message(addr, subject, _body(a), a.attach)
+    msg["To"] = ", ".join(to)
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    orig_id = (orig.get("Message-ID") or "").strip()
+    if orig_id:
+        msg["In-Reply-To"] = orig_id
+        msg["References"] = " ".join((orig.get("References") or "").split() + [orig_id])
+    smtp_send(addr, pw, msg)
+    append_to_sent(addr, pw, msg)
+    out({"sent": True, "reply_to_uid": a.uid, "to": to, "cc": cc, "subject": subject,
+         "in_reply_to": orig_id or None, "appended_to": SENT_FOLDER})
+
+
+def cmd_mark(cfg, a):
+    addr, pw = _mailbox(cfg, a.mailbox)
+    if a.action == "delete" and not a.yes:
+        die("deleting requires confirmation - add --yes")
+    M = imap_connect(addr, pw, a.folder)
+    try:
+        if a.action == "read":
+            typ, data = M.uid("STORE", str(a.uid), "+FLAGS", "(\\Seen)")
+            _check(typ, data, "STORE +Seen")
+            result = "read"
+        elif a.action == "unread":
+            typ, data = M.uid("STORE", str(a.uid), "-FLAGS", "(\\Seen)")
+            _check(typ, data, "STORE -Seen")
+            result = "unread"
+        elif a.folder == TRASH_FOLDER:
+            # inside Trash there is nowhere to move to - delete for good
+            typ, data = M.uid("STORE", str(a.uid), "+FLAGS", "(\\Deleted)")
+            _check(typ, data, "STORE +Deleted")
+            M.expunge()
+            result = "expunged"
+        else:
+            typ, data = M.uid("MOVE", str(a.uid), _quote_folder(TRASH_FOLDER))
+            _check(typ, data, "MOVE to %s" % TRASH_FOLDER)
+            result = "moved_to_%s" % TRASH_FOLDER
+    finally:
+        M.logout()
+    out({"uid": a.uid, "folder": a.folder, "result": result})
+
+
+# ---------------------------------------------------------------- commands: API
+
+def cmd_setup(cfg, a):
+    if not a.token and not a.default:
+        die("pass --token <API_TOKEN> (first run) or --default <address>")
+    if a.default and not a.token:
+        boxes = cfg.get("mailboxes") or {}
+        if a.default not in boxes:
+            die("mailbox %s is not configured (known: %s)"
+                % (a.default, ", ".join(sorted(boxes)) or "none"))
+        cfg["default_mailbox"] = a.default
+        _save_config(cfg)
+        out({"default_mailbox": a.default})
+        return
+
+    cfg["api_token"] = a.token
+    boxes = cfg.setdefault("mailboxes", {})
+    users = api_call(a.token, "listUser").get("users", [])
+    if not users:
+        die("the account has no mailboxes - nothing to configure")
+    created, skipped, failed = [], [], []
+    for addr in users:
+        if addr in boxes:
+            skipped.append(addr)         # idempotent: never overwrite a working password
+            continue
+        pw = api_call(a.token, "createAppPassword",
+                      {"userHandle": addr, "name": "pmail-cli"}).get("appPassword")
+        if not pw:
+            failed.append(addr)
+            continue
+        boxes[addr] = pw
+        created.append(addr)
+    if a.default:
+        if a.default not in boxes:
+            die("mailbox %s does not exist on the account (available: %s)" % (a.default, ", ".join(users)))
+        cfg["default_mailbox"] = a.default
+    elif not cfg.get("default_mailbox"):
+        cfg["default_mailbox"] = users[0]
+    _save_config(cfg)
+    if failed:
+        sys.stderr.write("pmail: could NOT generate an app password for: %s - those "
+                         "mailboxes will not work over IMAP/SMTP\n" % ", ".join(failed))
+    out({"config": _config_path(), "default_mailbox": cfg["default_mailbox"],
+         "app_passwords_created": created, "already_configured": skipped, "failed": failed})
+
+
+def cmd_credit(cfg, a):
+    out(api_call(_token(cfg), "checkAccountCredit"))
+
+
+def cmd_domains(cfg, a):
+    out(api_call(_token(cfg), "listDomains", {"includeShared": bool(a.shared)}))
+
+
+def cmd_domain_add(cfg, a):
+    api_call(_token(cfg), "addDomain", {"domainName": a.domain})
+    out({"added": a.domain})
+
+
+def cmd_domain_rm(cfg, a):
+    token = _token(cfg)
+    victims = [u for u in api_call(token, "listUser").get("users", [])
+               if u.lower().endswith("@" + a.domain.lower())]
+    if not a.yes:
+        die("deleting domain %s also deletes %d mailboxes (%s) - irreversible. Repeat with --yes"
+            % (a.domain, len(victims), ", ".join(victims) or "none"))
+    api_call(token, "deleteDomain", {"name": a.domain})
+    out({"deleted": a.domain, "deleted_users": victims})
+
+
+def _tribool(v):
+    return None if v is None else v == "yes"
+
+
+def cmd_domain_settings(cfg, a):
+    body = {"name": a.domain}
+    for key, val in (("allowAccountReset", _tribool(a.allow_account_reset)),
+                     ("symbolicSubaddressing", _tribool(a.symbolic_subaddressing))):
+        if val is not None:
+            body[key] = val
+    if a.recheck_dns:
+        body["recheckDns"] = True
+    if len(body) == 1:
+        die("nothing to change - pass --allow-account-reset/--symbolic-subaddressing yes|no "
+            "or --recheck-dns")
+    api_call(_token(cfg), "updateDomainSettings", body)
+    out({"updated": a.domain, "settings": body})
+
+
+def cmd_domain_ownership_code(cfg, a):
+    out(api_call(_token(cfg), "getOwnershipCode"))
+
+
+def cmd_users(cfg, a):
+    out(api_call(_token(cfg), "listUser"))
+
+
+def cmd_user_get(cfg, a):
+    out(api_call(_token(cfg), "getUser", {"userName": a.address}))
+
+
+def cmd_user_create(cfg, a):
+    if "@" not in a.address:
+        die("the address must look like user@domain.tld")
+    local, domain = a.address.rsplit("@", 1)
+    body = {"userName": local, "domainName": domain, "password": a.password,
+            "enablePasswordReset": bool(a.recovery_email or a.recovery_phone),
+            "enableSearchIndexing": not a.no_search_indexing,
+            "sendWelcomeEmail": bool(a.welcome_email)}
+    if a.recovery_email:
+        body["recoveryEmail"] = a.recovery_email
+    if a.recovery_phone:
+        body["recoveryPhone"] = a.recovery_phone
+    api_call(_token(cfg), "createUser", body)
+    out({"created": a.address})
+
+
+def cmd_user_modify(cfg, a):
+    body = {"userName": a.address}
+    if a.new_address:
+        body["newUserName"] = a.new_address
+    if a.new_password:
+        body["newPassword"] = a.new_password
+    for key, val in (("enableSearchIndexing", _tribool(a.search_indexing)),
+                     ("enablePasswordReset", _tribool(a.password_reset)),
+                     ("requireTwoFactorAuthentication", _tribool(a.two_factor))):
+        if val is not None:
+            body[key] = val
+    if len(body) == 1:
+        die("nothing to change - pass --new-address/--new-password/--search-indexing/"
+            "--password-reset/--two-factor")
+    api_call(_token(cfg), "modifyUser", body)
+    out({"modified": a.address, "changes": [k for k in body if k != "userName"]})
+
+
+def cmd_user_rm(cfg, a):
+    if not a.yes:
+        die("deleting mailbox %s is irreversible (mail included) - repeat with --yes"
+            % a.address)
+    api_call(_token(cfg), "deleteUser", {"userName": a.address})
+    if a.address in (cfg.get("mailboxes") or {}):
+        cfg["mailboxes"].pop(a.address)
+        if cfg.get("default_mailbox") == a.address:
+            cfg["default_mailbox"] = next(iter(cfg["mailboxes"]), None)
+        _save_config(cfg)
+    out({"deleted": a.address})
+
+
+def cmd_alias_list(cfg, a):
+    rules = api_call(_token(cfg), "listRoutingRules").get("rules", [])
+    if a.domain:
+        rules = [r for r in rules if (r.get("domainName") or "").lower() == a.domain.lower()]
+    out({"count": len(rules), "rules": rules})
+
+
+def cmd_alias_add(cfg, a):
+    api_call(_token(cfg), "createRoutingRule", {
+        "domainName": a.domain, "matchUser": a.match, "targetAddresses": a.target,
+        "prefix": bool(a.prefix), "catchall": bool(a.catchall)})
+    out({"created": {"domain": a.domain, "match": a.match, "targets": a.target,
+                     "prefix": bool(a.prefix), "catchall": bool(a.catchall)}})
+
+
+def cmd_alias_rm(cfg, a):
+    if not a.yes:
+        die("deleting routing rule id=%s is irreversible - repeat with --yes" % a.id)
+    api_call(_token(cfg), "deleteRoutingRule", {"routingRuleId": a.id})
+    out({"deleted_rule_id": a.id})
+
+
+def cmd_apppass_create(cfg, a):
+    res = api_call(_token(cfg), "createAppPassword",
+                   {"userHandle": a.address, "name": a.name})
+    if a.save:
+        cfg.setdefault("mailboxes", {})[a.address] = res.get("appPassword")
+        _save_config(cfg)
+    out({"address": a.address, "name": a.name, "appPassword": res.get("appPassword"),
+         "saved_to_config": bool(a.save)})
+
+
+def cmd_apppass_rm(cfg, a):
+    if not a.yes:
+        die("deleting the app password breaks live IMAP/SMTP sessions - repeat with --yes")
+    api_call(_token(cfg), "deleteAppPassword",
+             {"userName": a.address, "appPassword": a.password})
+    if (cfg.get("mailboxes") or {}).get(a.address) == a.password:
+        cfg["mailboxes"].pop(a.address)
+        _save_config(cfg)
+    out({"deleted_app_password_for": a.address})
+
+
+# ---------------------------------------------------------------- CLI
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="pmail", description="Purelymail CLI - mail (IMAP/SMTP) and account administration (API v0).")
+    ap.add_argument("--mailbox", help="mailbox address; defaults to default_mailbox from the config")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("setup", help="store the API token and generate app passwords")
+    s.add_argument("--token", help="token from the Purelymail panel (Account -> API)")
+    s.add_argument("--default", help="set the default mailbox")
+    s.set_defaults(func=cmd_setup)
+
+    sub.add_parser("folders", help="list the mailbox folders").set_defaults(func=cmd_folders)
+
+    i = sub.add_parser("inbox", help="headers of the most recent messages")
+    i.add_argument("-n", type=int, default=20)
+    i.add_argument("--unread", action="store_true")
+    i.add_argument("--folder", default="INBOX")
+    i.set_defaults(func=cmd_inbox)
+
+    se = sub.add_parser("search", help="search messages (IMAP SEARCH)")
+    se.add_argument("query", nargs="?", help="phrase searched across the whole message (TEXT)")
+    se.add_argument("--from", dest="from_", help="filter by sender")
+    se.add_argument("--since", help="only from this date on, YYYY-MM-DD")
+    se.add_argument("--folder", default="INBOX")
+    se.add_argument("-n", type=int, default=20)
+    se.set_defaults(func=cmd_search)
+
+    r = sub.add_parser("read", help="show a message (headers + body)")
+    r.add_argument("uid", type=int)
+    r.add_argument("--folder", default="INBOX")
+    r.add_argument("--json", action="store_true", help="print a JSON structure instead of text")
+    r.set_defaults(func=cmd_read)
+
+    sd = sub.add_parser("send", help="send a message (SMTP + APPEND to Sent)")
+    sd.add_argument("--to", nargs="+", required=True)
+    sd.add_argument("--cc", nargs="*")
+    sd.add_argument("--subject", required=True)
+    sd.add_argument("--body")
+    sd.add_argument("--body-file")
+    sd.add_argument("--attach", nargs="*")
+    sd.set_defaults(func=cmd_send)
+
+    rp = sub.add_parser("reply", help="reply to a message (In-Reply-To/References)")
+    rp.add_argument("uid", type=int)
+    rp.add_argument("--body")
+    rp.add_argument("--body-file")
+    rp.add_argument("--attach", nargs="*")
+    rp.add_argument("--all", action="store_true", help="reply-all (adds the original To/Cc)")
+    rp.add_argument("--folder", default="INBOX")
+    rp.set_defaults(func=cmd_reply)
+
+    mk = sub.add_parser("mark", help="mark read/unread, or delete")
+    mk.add_argument("uid", type=int)
+    mk.add_argument("action", choices=["read", "unread", "delete"])
+    mk.add_argument("--folder", default="INBOX")
+    mk.add_argument("--yes", action="store_true", help="required for delete")
+    mk.set_defaults(func=cmd_mark)
+
+    d = sub.add_parser("domains", help="list domains")
+    d.add_argument("--shared", action="store_true", help="include Purelymail shared domains")
+    d.set_defaults(func=cmd_domains)
+
+    dm = sub.add_parser("domain", help="domain operations").add_subparsers(
+        dest="sub", required=True)
+    da = dm.add_parser("add")
+    da.add_argument("domain")
+    da.set_defaults(func=cmd_domain_add)
+    dr = dm.add_parser("rm")
+    dr.add_argument("domain")
+    dr.add_argument("--yes", action="store_true")
+    dr.set_defaults(func=cmd_domain_rm)
+    ds = dm.add_parser("settings")
+    ds.add_argument("domain")
+    ds.add_argument("--allow-account-reset", choices=["yes", "no"])
+    ds.add_argument("--symbolic-subaddressing", choices=["yes", "no"])
+    ds.add_argument("--recheck-dns", action="store_true")
+    ds.set_defaults(func=cmd_domain_settings)
+    dm.add_parser("ownership-code").set_defaults(func=cmd_domain_ownership_code)
+
+    sub.add_parser("users", help="list the mailboxes on the account").set_defaults(func=cmd_users)
+
+    um = sub.add_parser("user", help="mailbox operations").add_subparsers(
+        dest="sub", required=True)
+    ug = um.add_parser("get")
+    ug.add_argument("address")
+    ug.set_defaults(func=cmd_user_get)
+    uc = um.add_parser("create")
+    uc.add_argument("address")
+    uc.add_argument("--password", required=True)
+    uc.add_argument("--recovery-email")
+    uc.add_argument("--recovery-phone")
+    uc.add_argument("--no-search-indexing", action="store_true")
+    uc.add_argument("--welcome-email", action="store_true")
+    uc.set_defaults(func=cmd_user_create)
+    umo = um.add_parser("modify")
+    umo.add_argument("address")
+    umo.add_argument("--new-address")
+    umo.add_argument("--new-password")
+    umo.add_argument("--search-indexing", choices=["yes", "no"])
+    umo.add_argument("--password-reset", choices=["yes", "no"])
+    umo.add_argument("--two-factor", choices=["yes", "no"])
+    umo.set_defaults(func=cmd_user_modify)
+    ur = um.add_parser("rm")
+    ur.add_argument("address")
+    ur.add_argument("--yes", action="store_true")
+    ur.set_defaults(func=cmd_user_rm)
+
+    al = sub.add_parser("alias", help="aliases = routing rules").add_subparsers(
+        dest="sub", required=True)
+    ali = al.add_parser("list")
+    ali.add_argument("--domain")
+    ali.set_defaults(func=cmd_alias_list)
+    ala = al.add_parser("add")
+    ala.add_argument("--domain", required=True)
+    ala.add_argument("--match", required=True, help="local part of the address, e.g. 'shop'")
+    ala.add_argument("--target", nargs="+", required=True, help="where to forward")
+    ala.add_argument("--prefix", action="store_true", help="also match 'match*'")
+    ala.add_argument("--catchall", action="store_true")
+    ala.set_defaults(func=cmd_alias_add)
+    alr = al.add_parser("rm")
+    alr.add_argument("--id", type=int, required=True)
+    alr.add_argument("--yes", action="store_true")
+    alr.set_defaults(func=cmd_alias_rm)
+
+    apw = sub.add_parser("apppass", help="IMAP/SMTP app passwords").add_subparsers(
+        dest="sub", required=True)
+    apc = apw.add_parser("create")
+    apc.add_argument("address")
+    apc.add_argument("--name", default="pmail-cli")
+    apc.add_argument("--save", action="store_true", help="save it into the pmail config")
+    apc.set_defaults(func=cmd_apppass_create)
+    apr = apw.add_parser("rm")
+    apr.add_argument("address")
+    apr.add_argument("--password", required=True)
+    apr.add_argument("--yes", action="store_true")
+    apr.set_defaults(func=cmd_apppass_rm)
+
+    sub.add_parser("credit", help="account status (credit)").set_defaults(func=cmd_credit)
+    return ap
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
+    cfg = _load_config(required=(a.cmd != "setup"))
+    a.func(cfg, a)
+
+
+if __name__ == "__main__":
+    main()
