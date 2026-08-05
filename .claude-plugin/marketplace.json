@@ -1,0 +1,30 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "pzmud",
+  "owner": {
+    "name": "p-zmud",
+    "url": "https://github.com/p-zmud"
+  },
+  "metadata": {
+    "description": "Skills, subagents, MCP servers and CLI tools for Claude Code - built and used in production by p-zmud",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "audytor-prawny-marketing",
+      "source": "./agents/audytor-prawny-marketing",
+      "description": "Audits content against Polish and EU law before publication - ad disclosure, copyright and likeness, GDPR, terms of service, contests, regulated industries - and returns a verdict with every provision opened in the run",
+      "category": "agents",
+      "keywords": [
+        "legal",
+        "compliance",
+        "poland",
+        "gdpr",
+        "rodo",
+        "advertising",
+        "marketing",
+        "audit"
+      ]
+    }
+  ]
+}

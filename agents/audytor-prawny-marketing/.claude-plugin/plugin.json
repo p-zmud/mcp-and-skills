@@ -1,0 +1,25 @@
+{
+  "name": "audytor-prawny-marketing",
+  "description": "Polish and EU legal compliance audit of content before it ships - social posts, terms of service, privacy policies, disclaimers, contests, client contracts. Verdict with sources opened in the run, never from memory.",
+  "version": "0.1.0",
+  "author": {
+    "name": "p-zmud",
+    "url": "https://github.com/p-zmud"
+  },
+  "homepage": "https://github.com/p-zmud/mcp-and-skills",
+  "repository": "https://github.com/p-zmud/mcp-and-skills",
+  "license": "MIT",
+  "keywords": [
+    "legal",
+    "compliance",
+    "poland",
+    "gdpr",
+    "rodo",
+    "advertising",
+    "marketing",
+    "audit"
+  ],
+  "agents": [
+    "./agents/audytor-prawny-marketing.md"
+  ]
+}

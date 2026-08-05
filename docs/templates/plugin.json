@@ -1,0 +1,13 @@
+{
+  "name": "<name>",
+  "description": "One line: what it does and when to use it",
+  "version": "0.1.0",
+  "author": {
+    "name": "p-zmud",
+    "url": "https://github.com/p-zmud"
+  },
+  "homepage": "https://github.com/p-zmud/mcp-and-skills",
+  "repository": "https://github.com/p-zmud/mcp-and-skills",
+  "license": "MIT",
+  "keywords": []
+}

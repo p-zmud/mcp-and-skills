@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "<name>": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/dist/index.js"],
+      "env": {
+        "<NAME>_API_TOKEN": "${<NAME>_API_TOKEN}"
+      }
+    }
+  }
+}
