@@ -4,6 +4,8 @@ A Claude Code plugin marketplace: skills, subagents, hooks, MCP servers and CLI 
 
 Everything listed in the marketplace installs directly in Claude Code.
 
+Built by [Piotr Żmudziński](https://www.linkedin.com/in/pzmudzinski).
+
 ## Install
 
 ```bash
@@ -15,13 +17,6 @@ Everything listed in the marketplace installs directly in Claude Code.
 Then `/plugin` to browse, enable and disable entries.
 
 ## Catalog
-
-### Skills
-
-Reusable capabilities Claude loads on demand.
-
-| Skill | What it does | Install |
-| ----- | ------------ | ------- |
 
 ### Agents
 
