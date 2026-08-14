@@ -138,12 +138,14 @@ going through `get_client().call(method, path, params=, json=)`, and returning `
 pytest tests/
 ```
 
-26 offline tests, plus 2 live ones that skip themselves unless `RAINDROP_TOKEN` is set.
+30 offline tests, plus 2 live ones that skip themselves unless `RAINDROP_TOKEN` is set.
 
 - `test_client.py` pins the client's gotchas with a fake session: `result:false` with and without
   an `errorMessage`, a retried 429, exhausted retries, an empty body, a raw download.
 - `test_registration.py` asserts that importing the server registers the full tool set, that
-  every name carries the `raindrop_` prefix, and that all 14 destructive tools expose `confirm`.
+  every name carries the `raindrop_` prefix, and that all 17 destructive tools expose `confirm`.
+  That set is pinned by equality, not by a hand-kept list, so the test also fails when a new
+  guarded tool appears or a guard quietly disappears from an existing one.
 - `test_live_integration.py` runs a full lifecycle against the real API through the tools
   themselves: create a throwaway collection, create and update a raindrop, add, edit and remove a
   highlight, bulk update, read filters, export to a temp file, and confirm the guard blocks an

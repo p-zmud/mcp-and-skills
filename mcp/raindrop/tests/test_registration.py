@@ -14,8 +14,26 @@ from src import mcp_server  # noqa: F401 - the import is what registers the tool
 from src.common import mcp
 
 
+# The complete set of tools behind the confirm guard. Pinned by equality below, so a
+# guard dropped from a tool and a new guarded tool missing from this list both fail.
+GUARDED = {
+    "raindrop_remove_collection", "raindrop_remove_collections",
+    "raindrop_merge_collections", "raindrop_remove_empty_collections",
+    "raindrop_reorder_collections", "raindrop_expand_collections",
+    "raindrop_remove", "raindrop_remove_many", "raindrop_update_many",
+    "raindrop_empty_trash", "raindrop_remove_highlight",
+    "raindrop_rename_tag", "raindrop_merge_tags", "raindrop_remove_tags",
+    "raindrop_remove_collaborator", "raindrop_share_collection",
+    "raindrop_update_user",
+}
+
+
 def _tools():
     return asyncio.run(mcp.list_tools())
+
+
+def _guarded_names():
+    return {t.name for t in _tools() if "confirm" in t.inputSchema.get("properties", {})}
 
 
 def test_all_tools_registered():
@@ -45,19 +63,19 @@ def test_expected_tools_present():
     assert not missing, f"missing tools: {missing}"
 
 
-@pytest.mark.parametrize("name", [
-    "raindrop_remove_collection", "raindrop_remove_collections",
-    "raindrop_merge_collections", "raindrop_remove_empty_collections",
-    "raindrop_reorder_collections", "raindrop_expand_collections",
-    "raindrop_remove", "raindrop_remove_many", "raindrop_empty_trash",
-    "raindrop_remove_highlight", "raindrop_remove_tags",
-    "raindrop_remove_collaborator", "raindrop_share_collection",
-    "raindrop_update_user",
-])
+@pytest.mark.parametrize("name", sorted(GUARDED))
 def test_destructive_tools_require_confirm(name):
     tool = next(t for t in _tools() if t.name == name)
     props = tool.inputSchema.get("properties", {})
     assert "confirm" in props, f"{name} has no confirm guard"
+
+
+def test_confirm_guard_set_is_exact():
+    actual = _guarded_names()
+    assert actual == GUARDED, (
+        f"guard lost: {sorted(GUARDED - actual)}; "
+        f"guarded but not in GUARDED: {sorted(actual - GUARDED)}"
+    )
 
 
 def test_confirm_guard_blocks_without_confirm():

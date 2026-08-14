@@ -1,7 +1,7 @@
 {
   "name": "raindrop",
   "description": "MCP server (stdio, FastMCP) covering the whole Raindrop.io REST API v1 in 50 tools: collections, bookmarks, tags, highlights, filters, sharing, import, backups, export, covers, file upload and the account.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "p-zmud",
     "url": "https://github.com/p-zmud"
